@@ -36,7 +36,16 @@ function Save-MindMeisterApiAuthInfo {
 	[CmdletBinding()]
 	param (
 		[Parameter()]
-		[string]$PersonalAccessToken,
+		[string]$V2PersonalAccessToken,
+
+		[Parameter()]
+		[string]$SharedKey,
+
+		[Parameter()]
+		[string]$SecretKey,
+
+		[Parameter()]
+		[string]$V1Token,
 	
 		[Parameter()]
 		[string]$RegistryKeyPath = "HKCU:\Software\PSMindMeister"
@@ -64,7 +73,71 @@ function Save-MindMeisterApiAuthInfo {
 	}
 }
 
-function Invoke-MindMeisterApiCall {
+function Get-MindMeisterApiV1Signature {
+	[OutputType('void')]
+	[CmdletBinding()]
+	param
+	(
+		[Parameter()]
+		[ValidateNotNullOrEmpty()]
+		[hashtable]$Parameters
+	)
+
+	$ErrorActionPreference = 'Stop'
+
+	function Get-MD5Hash {
+		param($String)
+
+		$md5 = new-object -TypeName System.Security.Cryptography.MD5CryptoServiceProvider
+		$utf8 = new-object -TypeName System.Text.UTF8Encoding
+		([System.BitConverter]::ToString($md5.ComputeHash($utf8.GetBytes($String))) -replace '-').ToLower()
+	}
+
+	$secretKey = Get-MindMeisterApiAuthInfo | Select-Object -ExpandProperty SecretKey
+
+	$paramsSorted  = [ordered]@{}
+	$Parameters.Keys | Sort-Object | ForEach-Object {
+		$paramsSorted[$_] = $Parameters[$_]
+	}
+	$paramString = ''
+	$paramsSorted.GetEnumerator().foreach({
+			$paramString += "$($_.Key)$($_.Value)"	
+		})
+	$paramString = "$($secretKey)$paramString"
+	Get-MD5Hash -String $paramString	
+}
+
+function Connect-MindMeisterApiV1 {
+	[OutputType('void')]
+	[CmdletBinding()]
+	param
+	()
+
+	$ErrorActionPreference = 'Stop'
+
+	$script:frob = (Invoke-MindMeisterApiCallV1 -ApiMethod 'mm.auth.getFrob').frob
+
+	$parameters = @{
+		perms   = 'delete'
+		api_key = (Get-MindMeisterApiAuthInfo | Select-Object -ExpandProperty SharedKey)
+		frob    = $script:frob
+	}
+	$sig = Get-MindMeisterApiV1Signature -Parameters $parameters
+
+	$paramString = ConvertTo-UriParameters -HttpBody $parameters
+
+	$authUri = "http://www.mindmeister.com/services/auth/?$paramString&api_sig=$sig"
+	Start-Process $authUri
+
+	if ($token = (Invoke-MindMeisterApiCallV1 -ApiMethod 'mm.auth.getToken' -Parameters @{'frob' = $script:frob }).auth.token) {
+		Save-MindMeisterApiAuthInfo -V1Token $token
+	} else {
+		throw 'Could not retrieve token.'
+	}
+	
+}
+
+function Invoke-MindMeisterApiCallV2 {
 	[OutputType('pscustomobject')]
 	[CmdletBinding()]
 	param
@@ -78,28 +151,104 @@ function Invoke-MindMeisterApiCall {
 
 		[Parameter()]
 		[ValidateNotNullOrEmpty()]
-		[int]$Version
+		[hashtable]$Payload
 	)
 
-	$ErrorActionPreference = 'Stop'
+	begin {
+		$ErrorActionPreference = 'Stop'
 
-	if (-not ($personalAccessToken = Get-MindMeisterApiAuthInfo | Select-Object -ExpandProperty PersonalAccessToken)) {
-		throw 'Could not find personal access token'
+		$apiCreds = Get-MindMeisterApiAuthInfo
 	}
+	process {
 
-	if ($Version -eq 2) {
 		$invRestParams = @{
 			Method      = $HttpMethod
 			Uri         = "https://www.mindmeister.com/api/v2/$Endpoint"
 			Headers     = @{ 
-				'Authorization' = "Bearer $personalAccessToken" 
+				'Authorization' = "Bearer $($apiCreds.V2PersonalAccessToken)" 
 				'Content-Type'  = 'application/json'
 			}
 			ErrorAction = 'Stop'
 		}
+		Invoke-RestMethod @invRestParams
 	}
+}
 
-	Invoke-RestMethod @invRestParams
+function ConvertTo-UriParameters {
+	[OutputType('string')]
+	[CmdletBinding()]
+	param
+	(
+		[Parameter(Mandatory)]
+		[ValidateNotNullOrEmpty()]
+		[hashtable]$HttpBody
+	)
+
+	$ErrorActionPreference = 'Stop'
+
+	$params = @()
+	$HttpBody.GetEnumerator().foreach({
+			$params += "$($_.Key)=$($_.Value)"
+		})
+	$params -join '&'
+}
+
+function Invoke-MindMeisterApiCallV1 {
+	[OutputType('pscustomobject')]
+	[CmdletBinding()]
+	param
+	(
+		[Parameter()]
+		[ValidateNotNullOrEmpty()]
+		[string]$ApiMethod,
+
+		[Parameter()]
+		[ValidateNotNullOrEmpty()]
+		[ValidateSet('auth', 'rest')]
+		[string]$ApiService = 'rest',
+
+		[Parameter()]
+		[string]$HttpMethod = 'GET',
+
+		[Parameter()]
+		[ValidateNotNullOrEmpty()]
+		[hashtable]$Parameters
+	)
+
+	$ErrorActionPreference = 'Stop'
+
+	$paramsToSign = @{
+		'api_key'         = (Get-MindMeisterApiAuthInfo).SharedKey
+		'response_format' = 'xml'
+	}
+	if ($PSBoundParameters.ContainsKey('Parameters')) {
+		$Parameters.GetEnumerator() | ForEach-Object {
+			$paramsToSign[$_.Key] = $_.Value
+		}	
+	}
+	if ($PSBoundParameters.ContainsKey('ApiMethod')) {
+		$paramsToSign.method = $ApiMethod
+		if ($ApiMethod -notlike 'mm.auth*') {
+			$paramsToSign.auth_token = (Get-MindMeisterApiAuthInfo).V1Token
+		}
+	}
+	
+	$sig = Get-MindMeisterApiV1Signature -Parameters $paramsToSign
+	$paramString = ConvertTo-UriParameters -HttpBody ($paramsToSign + @{'api_sig' = $sig})
+	$uri = 'https://www.mindmeister.com/services/{0}?{1}' -f $ApiService, $paramString
+
+	$invRestParams = @{
+		Uri         = $uri
+		Method      = $HttpMethod
+		ErrorAction = 'Stop'
+	}
+	
+	$result = Invoke-RestMethod @invRestParams
+	if ($result.stat -eq 'fail') {
+		throw $result.rsp.err.msg
+	} else {
+		$result.rsp
+	}
 }
 
 function Get-MindMeisterMap {
@@ -107,14 +256,25 @@ function Get-MindMeisterMap {
 	[CmdletBinding()]
 	param
 	(
-		[Parameter(Mandatory)]
+		[Parameter()]
 		[ValidateNotNullOrEmpty()]
-		[int]$Id
+		[int]$Id,
+
+		[Parameter()]
+		[ValidateNotNullOrEmpty()]
+		[string]$Name
 	)
 
 	$ErrorActionPreference = 'Stop'
 
-	$invMMParams = @{ Endpoint = "maps/$Id" }
-
-	Invoke-MindMeisterApiCall @invMMParams
+	if ($PSBoundParameters.Keys.Count -eq 0) {
+		(Invoke-MindMeisterApiCallV1 -ApiMethod 'mm.maps.getList').maps.map
+	} elseif ($PSBoundParameters.ContainsKey('Name')) {
+		$result = (Invoke-MindMeisterApiCallV1 -ApiMethod 'mm.maps.getList').maps.map
+		if ($map = $result.where({ $_.title -eq $Name })) {
+			Get-MindMeisterMap -Id $map.id
+		}
+	} elseif ($PSBoundParameters.ContainsKey('Id')) {
+		Invoke-MindMeisterApiCallV1 -ApiMethod 'mm.maps.getMap' -Parameters @{ 'map_id' = $Id }
+	}
 }

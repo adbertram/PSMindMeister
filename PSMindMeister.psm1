@@ -1,7 +1,60 @@
+function Get-JotFormApiKey {
+	[CmdletBinding()]
+	param
+	(
+		[Parameter()]
+		[ValidateNotNullOrEmpty()]
+		[string]$ApiKey,
+
+		[Parameter()]
+		[ValidateNotNullOrEmpty()]
+		[string]$RegistryKeyPath = 'HKCU:\Software\PSJotForm'
+	)
+	
+	$ErrorActionPreference = 'Stop'
+
+	function decrypt([string]$TextToDecrypt) {
+		$secure = ConvertTo-SecureString $TextToDecrypt
+		$hook = New-Object system.Management.Automation.PSCredential("test", $secure)
+		$plain = $hook.GetNetworkCredential().Password
+		return $plain
+	}
+
+	try {
+		if ($PSBoundParameters.ContainsKey('ApiKey')) {
+			$script:JotFormAPIKey = $ApiKey
+			$script:JotFormAPIKey
+		} elseif (Get-Variable -Name JotFormAPIKey -Scope Script -ErrorAction Ignore) {
+			$script:JotFormAPIKey
+		} elseif (-not (Test-Path -Path $RegistryKeyPath)) {
+			throw "No JotForm configuration found in registry"
+		} elseif (-not ($keyValues = Get-ItemProperty -Path $RegistryKeyPath)) {
+			throw 'JotForm API not found in registry'
+		} else {
+			$script:JotFormAPIKey = decrypt $keyValues.APIKey
+			$script:JotFormAPIKey
+		}
+	} catch {
+		Write-Error $_.Exception.Message
+	}
+}
+
 function Get-MindMeisterApiAuthInfo {
 	[CmdletBinding()]
 	param
 	(
+		[Parameter()]
+		[string]$PersonalAccessToken,
+
+		[Parameter()]
+		[string]$SharedKey,
+
+		[Parameter()]
+		[string]$SecretKey,
+
+		[Parameter()]
+		[string]$V1Token,
+
 		[Parameter()]
 		[ValidateNotNullOrEmpty()]
 		[string]$RegistryKeyPath = 'HKCU:\Software\PSMindMeister'
@@ -17,16 +70,27 @@ function Get-MindMeisterApiAuthInfo {
 	}
 
 	try {
-		if (-not (Test-Path -Path $RegistryKeyPath)) {
-			Write-Warning 'No PSMindMeister API info found in registry'
-		} else {
-			$keys = (Get-Item -Path $RegistryKeyPath).Property
-			$ht = @{}
-			foreach ($key in $keys) {
-				$ht[$key] = decrypt (Get-ItemProperty -Path $RegistryKeyPath).$key
-			}
-			[pscustomobject]$ht
+		if (-not $script:mindMeisterApiInfo) {
+			$script:mindMeisterApiInfo = [pscustomobject]@{}
 		}
+		
+		$params = 'PersonalAccessToken', 'SharedKey', 'SecretKey', 'V1Token'
+		foreach ($param in $params) {
+			if ($PSBoundParameters.ContainsKey($param)) {
+				Write-Verbose -Message "Found API val [$($param)] in passed parameter."
+				$script:mindMeisterApiInfo | Add-Member -NotePropertyName $param -NotePropertyValue (Get-Variable -Name $param).Value -Force
+			} elseif ($param -notin $script:mindMeisterApiInfo.PSObject.Properties.Name) {
+				if ($value = Get-ItemProperty -Path $RegistryKeyPath -Name $params -ErrorAction Ignore) {
+					Write-Verbose -Message "Found API val [$($param)] in registry."
+					$script:mindMeisterApiInfo | Add-Member -NotePropertyName $param -NotePropertyValue (decrypt $value.$param)
+				} else {
+					throw "The [$($param)] MindMeister API value could not be found."
+				}
+			} else {
+				Write-Verbose -Message "Found API val [$($param)] in existing script variable."
+			}
+		}
+		$script:mindMeisterApiInfo
 	} catch {
 		Write-Error $_.Exception.Message
 	}
